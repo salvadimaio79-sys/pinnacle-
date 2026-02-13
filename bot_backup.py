@@ -85,12 +85,42 @@ def get_avg_goals(row) -> float:
     return 0.0
 
 def filter_matches_by_avg(matches):
-    """Filtra match con AVG >= soglia ED esclude esports"""
+    """Filtra match con AVG >= soglia ED esclude esports ED filtra per oggi"""
     out = []
     excluded = 0
+    wrong_date = 0
+    
+    # Data di oggi
+    from datetime import datetime
+    today = datetime.now().strftime("%Y-%m-%d")  # es. "2024-12-16"
     
     for m in matches:
         try:
+            # Controlla data match
+            date_gmt = m.get("date_GMT", "")
+            
+            # Estrai data (formato: "Dec 16 2024" o "2024-12-16" o simili)
+            if date_gmt:
+                # Prova parsing diversi formati
+                match_date = None
+                
+                # Formato 1: "Dec 16 2024 - 3:00pm"
+                if "202" in date_gmt:  # Contiene anno
+                    import re
+                    # Estrai "Dec 16 2024"
+                    date_part = re.search(r'([A-Za-z]+ \d+ 202\d)', date_gmt)
+                    if date_part:
+                        try:
+                            dt = datetime.strptime(date_part.group(1), "%b %d %Y")
+                            match_date = dt.strftime("%Y-%m-%d")
+                        except:
+                            pass
+                
+                # Se non è oggi, salta
+                if match_date and match_date != today:
+                    wrong_date += 1
+                    continue
+            
             # Escludi esports
             league = m.get("League", "").lower()
             country = m.get("Country", "").lower()
@@ -108,6 +138,9 @@ def filter_matches_by_avg(matches):
     logger.info("Filtrati per AVG >= %.2f: %d", AVG_GOALS_THRESHOLD, len(out))
     if excluded > 0:
         logger.info("Esclusi %d match esports/virtuali", excluded)
+    if wrong_date > 0:
+        logger.info("Esclusi %d match di altri giorni", wrong_date)
+    
     return out
 
 # =========================
@@ -139,7 +172,18 @@ def get_live_matches():
             
             # Escludi esports
             league = event.get("league", {})
-            league_name = league.get("name", "Unknown") if isinstance(league, dict) else str(league)
+            
+            # Prova diversi formati per la lega
+            if isinstance(league, dict):
+                league_name = league.get("name") or league.get("cc") or "Unknown"
+            elif isinstance(league, str):
+                league_name = league
+            else:
+                league_name = "Unknown"
+            
+            # Fallback: prova anche "leagueName" o "competition"
+            if league_name == "Unknown":
+                league_name = event.get("leagueName") or event.get("competition") or event.get("tournament", {}).get("name", "Unknown")
             
             if any(kw in league_name.lower() for kw in LEAGUE_EXCLUDE_KEYWORDS):
                 continue
@@ -153,11 +197,20 @@ def get_live_matches():
                 except:
                     pass
             
-            # Estrai score
+            # Estrai score (gestisci stringhe vuote!)
             score_a = team_a.get("score", {})
             score_b = team_b.get("score", {})
-            home_score = int(score_a.get("f", 0)) if isinstance(score_a, dict) else 0
-            away_score = int(score_b.get("f", 0)) if isinstance(score_b, dict) else 0
+            
+            # Safe conversion - handle empty strings
+            try:
+                home_score = int(score_a.get("f", 0) or 0) if isinstance(score_a, dict) else 0
+            except (ValueError, TypeError):
+                home_score = 0
+            
+            try:
+                away_score = int(score_b.get("f", 0) or 0) if isinstance(score_b, dict) else 0
+            except (ValueError, TypeError):
+                away_score = 0
             
             events.append({
                 "home": home,
@@ -306,9 +359,14 @@ def check_matches():
             
             # Invia notifica
             avg = get_avg_goals(cm)
+            
+            # Estrai paese dal CSV
+            country = cm.get("Country", "Unknown")
+            
             msg = (
                 "🚨 <b>SEGNALE OVER 1.5!</b>\n\n"
                 f"⚽ <b>{lm['home']} vs {lm['away']}</b>\n"
+                f"🌍 {country}\n"
                 f"🏆 {lm['league']}\n"
                 f"📊 AVG Goals: <b>{avg:.2f}</b>\n"
                 f"⏱️ <b>{minute}'</b> - Risultato: <b>{lm['SS']}</b>\n"
