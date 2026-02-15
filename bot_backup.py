@@ -188,7 +188,7 @@ def get_live_matches():
             if any(kw in league_name.lower() for kw in LEAGUE_EXCLUDE_KEYWORDS):
                 continue
             
-            # Estrai minuto
+            # Estrai minuto E status
             timer = event.get("timer", "")
             minute = 0
             if timer and ':' in timer:
@@ -196,6 +196,16 @@ def get_live_matches():
                     minute = int(timer.split(':')[0])
                 except:
                     pass
+            
+            # Estrai STATUS (cerca vari formati)
+            status = event.get("status", "")
+            if not status:
+                status = event.get("state", "")
+            if not status:
+                status = event.get("matchStatus", "")
+            if not status:
+                # Fallback: cerca in event stesso
+                status = str(event.get("evt", ""))
             
             # Estrai score (gestisci stringhe vuote!)
             score_a = team_a.get("score", {})
@@ -219,7 +229,8 @@ def get_live_matches():
                 "minute": minute,
                 "home_score": home_score,
                 "away_score": away_score,
-                "SS": f"{home_score}-{away_score}"
+                "SS": f"{home_score}-{away_score}",
+                "status": status  # Aggiungi status!
             })
         
         logger.info("API live-events: %d match live", len(events))
@@ -340,9 +351,26 @@ def check_matches():
             
             matched += 1
             
-            # Controlla HT 0-0
+            # Controlla se è HALFTIME
             minute = lm.get("minute", 0)
-            if not (44 <= minute <= 47):
+            status = lm.get("status", "").upper()
+            
+            # Condizioni per essere a HALFTIME:
+            # 1. Status esplicito: "HT", "HALFTIME", "HALF-TIME"
+            # 2. Oppure minuto tra 45-47 (fallback se status non disponibile)
+            is_halftime = False
+            
+            if status in ["HT", "HALFTIME", "HALF-TIME", "HALF TIME", "H"]:
+                is_halftime = True
+                logger.info("✅ HALFTIME RILEVATO: %s vs %s (status: %s)", 
+                           lm['home'], lm['away'], status)
+            elif 45 <= minute <= 47:
+                # Fallback: usa minuti ma logga warning
+                is_halftime = True
+                logger.info("⚠️ HT da minuti: %s vs %s (%d') - status: %s", 
+                           lm['home'], lm['away'], minute, status or "N/A")
+            
+            if not is_halftime:
                 continue
             
             if lm.get("home_score", 0) != 0 or lm.get("away_score", 0) != 0:
@@ -401,3 +429,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
