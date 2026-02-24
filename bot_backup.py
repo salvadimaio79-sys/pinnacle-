@@ -351,30 +351,20 @@ def check_matches():
             
             matched += 1
             
-            # Controlla se è HALFTIME
+            # Controlla se è al 60° MINUTO e ancora 0-0
             minute = lm.get("minute", 0)
-            status = lm.get("status", "").upper()
             
-            # Condizioni per essere a HALFTIME:
-            # 1. Status esplicito: "HT", "HALFTIME", "HALF-TIME"
-            # 2. Oppure minuto tra 45-47 (fallback se status non disponibile)
-            is_halftime = False
-            
-            if status in ["HT", "HALFTIME", "HALF-TIME", "HALF TIME", "H"]:
-                is_halftime = True
-                logger.info("✅ HALFTIME RILEVATO: %s vs %s (status: %s)", 
-                           lm['home'], lm['away'], status)
-            elif 45 <= minute <= 47:
-                # Fallback: usa minuti ma logga warning
-                is_halftime = True
-                logger.info("⚠️ HT da minuti: %s vs %s (%d') - status: %s", 
-                           lm['home'], lm['away'], minute, status or "N/A")
-            
-            if not is_halftime:
+            # Deve essere tra 60-62 minuti (60' + eventuale ritardo)
+            if not (60 <= minute <= 62):
                 continue
             
+            # Deve essere ancora 0-0
             if lm.get("home_score", 0) != 0 or lm.get("away_score", 0) != 0:
                 continue
+            
+            # Match 0-0 al 60'!
+            logger.info("🎯 Match 0-0 al 60': %s vs %s (%d')", 
+                       lm['home'], lm['away'], minute)
             
             # Match a HT 0-0!
             logger.info("Abbinato: %s vs %s | %s | %d' | %s",
@@ -392,14 +382,16 @@ def check_matches():
             country = cm.get("Country", "Unknown")
             
             msg = (
-                "🚨 <b>SEGNALE OVER 1.5!</b>\n\n"
+                "🚨 <b>SEGNALE OVER 0.5 FT!</b>\n\n"
                 f"⚽ <b>{lm['home']} vs {lm['away']}</b>\n"
                 f"🌍 {country}\n"
                 f"🏆 {lm['league']}\n"
                 f"📊 AVG Goals: <b>{avg:.2f}</b>\n"
-                f"⏱️ <b>{minute}'</b> - Risultato: <b>{lm['SS']}</b>\n"
-                "✅ Controlla quote live!\n\n"
-                "🎯 <b>Punta Over 1.5 FT</b>"
+                f"⏱️ <b>{minute}'</b> - Risultato: <b>{lm['SS']}</b>\n\n"
+                "💡 <b>Match al 60' ancora 0-0!</b>\n"
+                "🎯 <b>Punta Over 0.5 FT</b>\n\n"
+                "✅ Squadre ad alto AVG senza gol al 60'\n"
+                "🔥 Alta probabilità di gol nei minuti finali!"
             )
             
             if send_telegram_message(msg):
@@ -429,4 +421,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
+            
