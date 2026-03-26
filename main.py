@@ -1,7 +1,7 @@
 import requests
 import time
 import logging
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 # ── CONFIG ──────────────────────────────────────────────────────────────
 RAPIDAPI_KEY = "785e7ea308mshc88fb29d2de2ac7p12a681jsn71d79500bcd9"
@@ -11,12 +11,13 @@ API_URL = "https://pinnacle-football-odds.p.rapidapi.com/dropping_odds"
 TELEGRAM_TOKEN = "7912248885:AAFwOdg0rX3weVr6NXzW1adcUorvlRY8LyI"
 CHAT_ID = "-1003588715273"
 
-POLL_INTERVAL = 300     # 5 minuti
+POLL_INTERVAL = 60       # 1 minuto — più fresco possibile
+MAX_AGE_MINUTES = 15     # ignora movimenti più vecchi di 15 minuti
 
-# ── FILTRI ───────────────────────────────────────────────────────────────
+# ── FILTRI QUOTE ─────────────────────────────────────────────────────────
 QUOTA_MIN = 1.20
 QUOTA_MAX = 2.50
-MIN_MOVE_PCT = 5.0      # % minima rispetto all'ULTIMA quota notificata
+MIN_MOVE_PCT = 5.0       # % minima rispetto all'ultima quota notificata
 # ────────────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
@@ -25,13 +26,35 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# Dizionario: "eventId|selection" → ultima quota notificata
-# Es: "1626545858|AWAY" → 2.10
+# "eventId|selection" → ultima quota notificata
 last_notified_price: dict = {}
+
+# Mappa selezione → etichetta 1X2
+SELECTION_LABEL = {
+    "HOME": "1",
+    "DRAW": "X",
+    "AWAY": "2",
+}
 
 
 def make_track_key(row: dict) -> str:
     return f"{row['eventId']}|{row['selection']}"
+
+
+def is_fresh(row: dict) -> bool:
+    """Restituisce True se il movimento è avvenuto negli ultimi MAX_AGE_MINUTES minuti."""
+    ts_str = row.get("time", "")
+    if not ts_str:
+        return True  # se non c'è timestamp, lascia passare
+    try:
+        # Formato: "2026-03-26 05:51:22.123"
+        ts = datetime.strptime(ts_str[:19], "%Y-%m-%d %H:%M:%S")
+        ts = ts.replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        age = (now - ts).total_seconds() / 60
+        return age <= MAX_AGE_MINUTES
+    except Exception:
+        return True
 
 
 def fetch_movements() -> list:
@@ -61,16 +84,7 @@ def fetch_movements() -> list:
 
 def should_notify(row: dict) -> tuple:
     """
-    Logica di notifica basata sull'ultima quota notificata.
-
-    PRIMA VOLTA (partita mai vista):
-      → notifica se old→new >= 5%
-
-    GIA' NOTIFICATA:
-      → confronta last_price → new
-      → notifica solo se si è mossa ancora di >=5% rispetto all'ultima notifica
-      → ignora se ferma o si è mossa meno del 5%
-
+    Controlla se mandare notifica.
     Restituisce (True, direction, pct) oppure (False, "", 0)
     """
     if row.get("marketType") != "1X2":
@@ -78,9 +92,13 @@ def should_notify(row: dict) -> tuple:
     if "prematch" not in row.get("source", ""):
         return False, "", 0
 
+    # Filtro freschezza timestamp
+    if not is_fresh(row):
+        return False, "", 0
+
     old = row.get("oldPrice", 0)
     new = row.get("newPrice", 0)
-    if old <= 0 or new <= 0:
+    if old <= 0 or new <= 0 or old == new:
         return False, "", 0
 
     if not (QUOTA_MIN <= old <= QUOTA_MAX):
@@ -92,23 +110,17 @@ def should_notify(row: dict) -> tuple:
     last_price = last_notified_price.get(track_key)
 
     if last_price is None:
-        # Prima volta: confronta old → new
         pct = abs((new - old) / old) * 100
         if pct < MIN_MOVE_PCT:
             return False, "", 0
-        direction = "CALO" if new < old else "RIALZO"
-        return True, direction, pct
+        return True, ("CALO" if new < old else "RIALZO"), pct
     else:
-        # Già notificata: confronta last_price → new
         if last_price == new:
             return False, "", 0
-
         pct = abs((new - last_price) / last_price) * 100
         if pct < MIN_MOVE_PCT:
             return False, "", 0
-
-        direction = "CALO" if new < last_price else "RIALZO"
-        return True, direction, pct
+        return True, ("CALO" if new < last_price else "RIALZO"), pct
 
 
 def send_telegram(text: str) -> bool:
@@ -141,13 +153,17 @@ def build_message(row: dict, direction: str, pct: float, is_continuation: bool) 
     new = row["newPrice"]
     ts = row.get("time", "")[:16]
     label = intensity_label(pct)
+
+    # Etichetta 1 / X / 2
+    sel_raw = row.get("selection", "")
+    sel_label = SELECTION_LABEL.get(sel_raw, sel_raw)
+
     track_key = make_track_key(row)
     last_price = last_notified_price.get(track_key)
 
     dir_emoji = "📉" if direction == "CALO" else "📈"
-    dir_text = "⬇️ CALO QUOTA" if direction == "CALO" else "⬆️ RIALZO QUOTA"
+    dir_text = "⬇️ CALO" if direction == "CALO" else "⬆️ RIALZO"
     hint = "💡 <i>Selezione sta diventando favorita</i>" if direction == "CALO" else "💡 <i>Selezione sta diventando outsider</i>"
-    sel_emoji = {"HOME": "🏠", "AWAY": "✈️", "DRAW": "🤝"}.get(row["selection"], "🎯")
 
     continuation_line = ""
     if is_continuation and last_price:
@@ -159,7 +175,7 @@ def build_message(row: dict, direction: str, pct: float, is_continuation: bool) 
         f"🏆 <b>{row['league']}</b>\n"
         f"⚽ <b>{row['home']} vs {row['away']}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"{sel_emoji} Selezione: <b>{row['selection']}</b>\n"
+        f"🎯 Selezione: <b>{sel_label}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"💰 <b>{old:.2f} → {new:.2f}</b>  ({pct:.1f}%)  {label}\n"
         f"{continuation_line}"
@@ -177,18 +193,22 @@ def run():
         f"📊 Mercato: <b>Solo 1X2 pre-partita</b>\n"
         f"📏 Range quote: <b>{QUOTA_MIN} → {QUOTA_MAX}</b>\n"
         f"⚡ Soglia: <b>{MIN_MOVE_PCT}%</b> rispetto all'ultima quota notificata\n"
+        f"🕐 Solo movimenti freschi (max {MAX_AGE_MINUTES} min)\n"
         f"🔁 Movimenti continui tracciati\n"
-        f"⏱ Controllo ogni 5 minuti"
+        f"⏱ Controllo ogni {POLL_INTERVAL} secondi"
     )
 
     while True:
         log.info("Controllo movimenti...")
         rows = fetch_movements()
         new_alerts = 0
+        skipped_old = 0
 
         for row in rows:
             valid, direction, pct = should_notify(row)
             if not valid:
+                if not is_fresh(row):
+                    skipped_old += 1
                 continue
 
             track_key = make_track_key(row)
@@ -198,16 +218,20 @@ def run():
             if send_telegram(msg):
                 last_notified_price[track_key] = row["newPrice"]
                 new_alerts += 1
+                sel_label = SELECTION_LABEL.get(row.get("selection", ""), row.get("selection", ""))
                 log.info(
-                    f"{'CONTINUA' if is_continuation else 'NUOVO'} | "
+                    f"{'CONT' if is_continuation else 'NEW'} | "
                     f"{direction} {pct:.1f}% | "
                     f"{row['home']} vs {row['away']} | "
-                    f"{row['oldPrice']:.2f}→{row['newPrice']:.2f} | "
-                    f"{row['selection']}"
+                    f"{row['oldPrice']:.2f}→{row['newPrice']:.2f} | [{sel_label}]"
                 )
-                time.sleep(0.5)
+                time.sleep(0.3)
 
-        log.info(f"Ciclo: {new_alerts} alert | {len(last_notified_price)} partite tracciate")
+        log.info(
+            f"Ciclo: {new_alerts} alert | "
+            f"{skipped_old} vecchi ignorati | "
+            f"{len(last_notified_price)} partite tracciate"
+        )
 
         if len(last_notified_price) > 500:
             last_notified_price.clear()
