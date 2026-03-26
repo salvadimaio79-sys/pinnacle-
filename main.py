@@ -13,13 +13,10 @@ CHAT_ID = "-1003588715273"
 
 POLL_INTERVAL = 300     # 5 minuti
 
-# ── FILTRI QUOTE ─────────────────────────────────────────────────────────
-QUOTA_MIN = 1.20        # soglia bassa del range
-QUOTA_MAX = 2.50        # soglia alta del range
-
-# CALO:   oldPrice <= QUOTA_MAX  AND  newPrice >= QUOTA_MIN  (scende dentro il range)
-# RIALZO: oldPrice >= QUOTA_MIN  AND  newPrice <= QUOTA_MAX  (sale dentro il range)
-# In entrambi i casi sia old che new devono stare nel range 1.20 - 2.50
+# ── FILTRI ───────────────────────────────────────────────────────────────
+QUOTA_MIN = 1.20
+QUOTA_MAX = 2.50
+MIN_MOVE_PCT = 5.0      # % minima rispetto all'ULTIMA quota notificata
 # ────────────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
@@ -28,7 +25,13 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-notified_keys: set = set()
+# Dizionario: "eventId|selection" → ultima quota notificata
+# Es: "1626545858|AWAY" → 2.10
+last_notified_price: dict = {}
+
+
+def make_track_key(row: dict) -> str:
+    return f"{row['eventId']}|{row['selection']}"
 
 
 def fetch_movements() -> list:
@@ -40,60 +43,72 @@ def fetch_movements() -> list:
     params = {
         "limit": 200,
         "historyDays": 1,
-        "minDropPct": 1,          # soglia bassa, filtriamo noi per quote
+        "minDropPct": 1,
         "dropMode": "total",
         "time": "today",
-        "period": 0,              # full match
+        "period": 0,
         "sort": "dropPct",
         "order": "desc",
     }
     try:
         r = requests.get(API_URL, headers=headers, params=params, timeout=15)
         r.raise_for_status()
-        data = r.json()
-        return data.get("rows", [])
+        return r.json().get("rows", [])
     except Exception as e:
         log.error(f"Errore fetch API: {e}")
         return []
 
 
-def is_valid_movement(row: dict) -> tuple[bool, str]:
+def should_notify(row: dict) -> tuple:
     """
-    Controlla se il movimento rispetta i criteri:
-    - Solo mercato 1X2
-    - Solo pre-partita (source prematch)
-    - oldPrice e newPrice entrambi nel range 1.20 - 2.50
-    - Direzione coerente (calo o rialzo reale)
+    Logica di notifica basata sull'ultima quota notificata.
 
-    Restituisce (True, "CALO"/"RIALZO") oppure (False, "")
+    PRIMA VOLTA (partita mai vista):
+      → notifica se old→new >= 5%
+
+    GIA' NOTIFICATA:
+      → confronta last_price → new
+      → notifica solo se si è mossa ancora di >=5% rispetto all'ultima notifica
+      → ignora se ferma o si è mossa meno del 5%
+
+    Restituisce (True, direction, pct) oppure (False, "", 0)
     """
-    # Solo 1X2
     if row.get("marketType") != "1X2":
-        return False, ""
-
-    # Solo pre-partita
-    source = row.get("source", "")
-    if "prematch" not in source:
-        return False, ""
+        return False, "", 0
+    if "prematch" not in row.get("source", ""):
+        return False, "", 0
 
     old = row.get("oldPrice", 0)
     new = row.get("newPrice", 0)
-
     if old <= 0 or new <= 0:
-        return False, ""
+        return False, "", 0
 
-    # Entrambe le quote devono stare nel range 1.20 - 2.50
     if not (QUOTA_MIN <= old <= QUOTA_MAX):
-        return False, ""
+        return False, "", 0
     if not (QUOTA_MIN <= new <= QUOTA_MAX):
-        return False, ""
+        return False, "", 0
 
-    # Deve esserci un movimento reale
-    if old == new:
-        return False, ""
+    track_key = make_track_key(row)
+    last_price = last_notified_price.get(track_key)
 
-    direction = "CALO" if new < old else "RIALZO"
-    return True, direction
+    if last_price is None:
+        # Prima volta: confronta old → new
+        pct = abs((new - old) / old) * 100
+        if pct < MIN_MOVE_PCT:
+            return False, "", 0
+        direction = "CALO" if new < old else "RIALZO"
+        return True, direction, pct
+    else:
+        # Già notificata: confronta last_price → new
+        if last_price == new:
+            return False, "", 0
+
+        pct = abs((new - last_price) / last_price) * 100
+        if pct < MIN_MOVE_PCT:
+            return False, "", 0
+
+        direction = "CALO" if new < last_price else "RIALZO"
+        return True, direction, pct
 
 
 def send_telegram(text: str) -> bool:
@@ -113,35 +128,30 @@ def send_telegram(text: str) -> bool:
         return False
 
 
-def movimento_label(old: float, new: float) -> str:
-    """Indica quanto è significativo il movimento in termini assoluti."""
-    diff = abs(new - old)
-    pct = abs((new - old) / old) * 100
+def intensity_label(pct: float) -> str:
     if pct >= 20:
         return "🔥 FORTE"
     elif pct >= 10:
         return "⚡ MEDIO"
-    else:
-        return "📌 LIEVE"
+    return "📌 LIEVE"
 
 
-def build_message(row: dict, direction: str) -> str:
+def build_message(row: dict, direction: str, pct: float, is_continuation: bool) -> str:
     old = row["oldPrice"]
     new = row["newPrice"]
-    pct = abs((new - old) / old) * 100
     ts = row.get("time", "")[:16]
-    label = movimento_label(old, new)
+    label = intensity_label(pct)
+    track_key = make_track_key(row)
+    last_price = last_notified_price.get(track_key)
 
-    if direction == "CALO":
-        dir_emoji = "📉"
-        dir_text = "⬇️ CALO QUOTA"
-        hint = "💡 <i>La selezione sta diventando favorita</i>"
-    else:
-        dir_emoji = "📈"
-        dir_text = "⬆️ RIALZO QUOTA"
-        hint = "💡 <i>La selezione sta diventando outsider</i>"
-
+    dir_emoji = "📉" if direction == "CALO" else "📈"
+    dir_text = "⬇️ CALO QUOTA" if direction == "CALO" else "⬆️ RIALZO QUOTA"
+    hint = "💡 <i>Selezione sta diventando favorita</i>" if direction == "CALO" else "💡 <i>Selezione sta diventando outsider</i>"
     sel_emoji = {"HOME": "🏠", "AWAY": "✈️", "DRAW": "🤝"}.get(row["selection"], "🎯")
+
+    continuation_line = ""
+    if is_continuation and last_price:
+        continuation_line = f"🔁 <i>Continua: ultima notifica a {last_price:.2f}</i>\n"
 
     msg = (
         f"{dir_emoji} <b>PINNACLE 1X2</b> — {dir_text}\n"
@@ -152,6 +162,7 @@ def build_message(row: dict, direction: str) -> str:
         f"{sel_emoji} Selezione: <b>{row['selection']}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"💰 <b>{old:.2f} → {new:.2f}</b>  ({pct:.1f}%)  {label}\n"
+        f"{continuation_line}"
         f"🕐 Rilevato: {ts}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"{hint}"
@@ -160,12 +171,13 @@ def build_message(row: dict, direction: str) -> str:
 
 
 def run():
-    log.info("🤖 Pinnacle 1X2 Range Bot avviato")
+    log.info("🤖 Pinnacle 1X2 Bot avviato")
     send_telegram(
-        "🤖 <b>Pinnacle 1X2 Range Bot avviato!</b>\n\n"
+        "🤖 <b>Pinnacle 1X2 Bot avviato!</b>\n\n"
         f"📊 Mercato: <b>Solo 1X2 pre-partita</b>\n"
-        f"📏 Range quote monitorato: <b>{QUOTA_MIN} → {QUOTA_MAX}</b>\n"
-        f"📉 Cali e 📈 rialzi nel range\n"
+        f"📏 Range quote: <b>{QUOTA_MIN} → {QUOTA_MAX}</b>\n"
+        f"⚡ Soglia: <b>{MIN_MOVE_PCT}%</b> rispetto all'ultima quota notificata\n"
+        f"🔁 Movimenti continui tracciati\n"
         f"⏱ Controllo ogni 5 minuti"
     )
 
@@ -173,39 +185,33 @@ def run():
         log.info("Controllo movimenti...")
         rows = fetch_movements()
         new_alerts = 0
-        filtered = 0
 
         for row in rows:
-            key = row.get("oddsKey", "")
-            if not key or key in notified_keys:
-                continue
-
-            valid, direction = is_valid_movement(row)
+            valid, direction, pct = should_notify(row)
             if not valid:
-                filtered += 1
                 continue
 
-            msg = build_message(row, direction)
+            track_key = make_track_key(row)
+            is_continuation = track_key in last_notified_price
+
+            msg = build_message(row, direction, pct, is_continuation)
             if send_telegram(msg):
-                notified_keys.add(key)
+                last_notified_price[track_key] = row["newPrice"]
                 new_alerts += 1
                 log.info(
-                    f"{direction} | {row['home']} vs {row['away']} | "
+                    f"{'CONTINUA' if is_continuation else 'NUOVO'} | "
+                    f"{direction} {pct:.1f}% | "
+                    f"{row['home']} vs {row['away']} | "
                     f"{row['oldPrice']:.2f}→{row['newPrice']:.2f} | "
                     f"{row['selection']}"
                 )
                 time.sleep(0.5)
 
-        log.info(
-            f"Ciclo: {new_alerts} alert inviati | "
-            f"{filtered} movimenti fuori range | "
-            f"{len(rows)} totali ricevuti"
-        )
+        log.info(f"Ciclo: {new_alerts} alert | {len(last_notified_price)} partite tracciate")
 
-        # Pulizia cache ogni 2000 chiavi
-        if len(notified_keys) > 2000:
-            notified_keys.clear()
-            log.info("Cache notifiche resettata")
+        if len(last_notified_price) > 500:
+            last_notified_price.clear()
+            log.info("Cache prezzi resettata")
 
         time.sleep(POLL_INTERVAL)
 
